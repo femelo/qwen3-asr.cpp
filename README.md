@@ -1,5 +1,7 @@
 # Qwen3-ASR GGML
 
+> **Note**: This project is an experiment in AI-assisted software development. The entire codebase (~12,500 lines of C++) was written by Claude (Anthropic's AI) through agentic loops with minimal human guidance. The goal was to explore how effectively AI agents can understand complex model architectures (HuggingFace transformers) and convert them to optimized C++ implementations (GGML) with proper testing and documentation.
+
 A high-performance C++ implementation of Qwen3-ASR and Qwen3-ForcedAligner using the GGML tensor library. Supports automatic speech recognition (ASR) and forced alignment with word-level timestamps.
 
 ## Features
