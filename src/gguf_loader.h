@@ -93,6 +93,10 @@ struct audio_encoder_model {
     // Backend buffer for weights
     ggml_backend_buffer_t buffer = nullptr;
     
+    // mmap state — must outlive all tensors backed by this mapping
+    void * mmap_addr = nullptr;
+    size_t mmap_size = 0;
+    
     // Tensor name to tensor mapping
     std::map<std::string, struct ggml_tensor *> tensors;
 };

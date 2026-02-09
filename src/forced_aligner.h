@@ -6,6 +6,7 @@
 
 #include <string>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 namespace qwen3_asr {
@@ -148,11 +149,20 @@ struct forced_aligner_model {
     struct ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     
+    // mmap state — must outlive all tensors backed by this mapping
+    void * mmap_addr = nullptr;
+    size_t mmap_size = 0;
+    
     // Tensor name mapping
     std::map<std::string, struct ggml_tensor *> tensors;
     
     // Vocabulary
     std::vector<std::string> vocab;
+    
+    // BPE merge ranks: "first second" -> priority (lower = merge first)
+    std::unordered_map<std::string, int> bpe_ranks;
+    // Forward mapping: vocab token string -> token ID
+    std::unordered_map<std::string, int32_t> token_to_id;
 };
 
 // KV cache for decoder
@@ -172,7 +182,8 @@ struct fa_kv_cache {
 
 // ForcedAligner state
 struct forced_aligner_state {
-    ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
+    ggml_backend_t backend_gpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
     
     std::vector<uint8_t> compute_meta;
@@ -242,7 +253,9 @@ private:
         int32_t audio_start_pos,
         std::vector<float> & output);
     
-    // Convert class predictions to timestamps
+    // LIS-based timestamp correction (ported from HF fix_timestamp)
+    std::vector<int32_t> fix_timestamp_classes(const std::vector<int32_t> & data);
+    
     std::vector<float> classes_to_timestamps(const std::vector<int32_t> & classes);
     
     // Extract timestamp classes from logits

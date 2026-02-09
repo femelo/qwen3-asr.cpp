@@ -28,9 +28,13 @@ AudioEncoder::~AudioEncoder() {
         ggml_backend_sched_free(state_.sched);
         state_.sched = nullptr;
     }
-    if (state_.backend) {
-        ggml_backend_free(state_.backend);
-        state_.backend = nullptr;
+    if (state_.backend_gpu) {
+        ggml_backend_free(state_.backend_gpu);
+        state_.backend_gpu = nullptr;
+    }
+    if (state_.backend_cpu) {
+        ggml_backend_free(state_.backend_cpu);
+        state_.backend_cpu = nullptr;
     }
     free_model(model_);
 }
@@ -42,14 +46,32 @@ bool AudioEncoder::load_model(const std::string & model_path) {
         return false;
     }
     
-    state_.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!state_.backend) {
+    state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!state_.backend_cpu) {
         error_msg_ = "Failed to initialize CPU backend";
         return false;
     }
-    
-    std::vector<ggml_backend_t> backends = { state_.backend };
-    state_.sched = ggml_backend_sched_new(backends.data(), nullptr, 1, QWEN3_ASR_MAX_NODES, false, true);
+
+    state_.backend_gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+
+    std::vector<ggml_backend_t> backends;
+    std::vector<ggml_backend_buffer_type_t> backend_bufts;
+
+    if (state_.backend_gpu) {
+        backends.push_back(state_.backend_gpu);
+        backend_bufts.push_back(ggml_backend_get_default_buffer_type(state_.backend_gpu));
+    }
+
+    backends.push_back(state_.backend_cpu);
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(state_.backend_cpu);
+    if (state_.backend_gpu) {
+        ggml_backend_dev_t gpu_dev = ggml_backend_get_device(state_.backend_gpu);
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu_dev);
+        if (host_buft) cpu_buft = host_buft;
+    }
+    backend_bufts.push_back(cpu_buft);
+
+    state_.sched = ggml_backend_sched_new(backends.data(), backend_bufts.data(), backends.size(), QWEN3_ASR_MAX_NODES, false, true);
     if (!state_.sched) {
         error_msg_ = "Failed to create backend scheduler";
         return false;

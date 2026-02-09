@@ -5,6 +5,10 @@
 #include <cstring>
 #include <cstdio>
 #include <fstream>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define QWEN3_ASR_MAX_NODES 8192
 
@@ -18,9 +22,13 @@ TextDecoder::~TextDecoder() {
         ggml_backend_sched_free(state_.sched);
         state_.sched = nullptr;
     }
-    if (state_.backend) {
-        ggml_backend_free(state_.backend);
-        state_.backend = nullptr;
+    if (state_.backend_gpu) {
+        ggml_backend_free(state_.backend_gpu);
+        state_.backend_gpu = nullptr;
+    }
+    if (state_.backend_cpu) {
+        ggml_backend_free(state_.backend_cpu);
+        state_.backend_cpu = nullptr;
     }
     free_decoder_model(model_);
 }
@@ -67,14 +75,32 @@ bool TextDecoder::load_model(const std::string & model_path) {
     gguf_free(ctx);
     if (meta_ctx) ggml_free(meta_ctx);
     
-    state_.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!state_.backend) {
+    state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!state_.backend_cpu) {
         error_msg_ = "Failed to initialize CPU backend";
         return false;
     }
-    
-    std::vector<ggml_backend_t> backends = { state_.backend };
-    state_.sched = ggml_backend_sched_new(backends.data(), nullptr, 1, QWEN3_ASR_MAX_NODES, false, true);
+
+    state_.backend_gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+
+    std::vector<ggml_backend_t> backends;
+    std::vector<ggml_backend_buffer_type_t> backend_bufts;
+
+    if (state_.backend_gpu) {
+        backends.push_back(state_.backend_gpu);
+        backend_bufts.push_back(ggml_backend_get_default_buffer_type(state_.backend_gpu));
+    }
+
+    backends.push_back(state_.backend_cpu);
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(state_.backend_cpu);
+    if (state_.backend_gpu) {
+        ggml_backend_dev_t gpu_dev = ggml_backend_get_device(state_.backend_gpu);
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu_dev);
+        if (host_buft) cpu_buft = host_buft;
+    }
+    backend_bufts.push_back(cpu_buft);
+
+    state_.sched = ggml_backend_sched_new(backends.data(), backend_bufts.data(), backends.size(), QWEN3_ASR_MAX_NODES, false, true);
     if (!state_.sched) {
         error_msg_ = "Failed to create backend scheduler";
         return false;
@@ -158,9 +184,8 @@ bool TextDecoder::create_tensors(struct gguf_context * ctx) {
             ne[1] = cfg.hidden_size;
             n_dims = 2;
         } else if (strstr(name, "output.weight")) {
-            ne[0] = cfg.hidden_size;
-            ne[1] = cfg.vocab_size;
-            n_dims = 2;
+            // Weight tying: output.weight aliases token_embd.weight
+            continue;
         } else if (strstr(name, "attn_norm.weight")) {
             ne[0] = cfg.hidden_size;
             n_dims = 1;
@@ -231,72 +256,78 @@ bool TextDecoder::create_tensors(struct gguf_context * ctx) {
                 else if (strstr(name, "ffn_up.weight")) layer.ffn_up = tensor;
                 else if (strstr(name, "ffn_down.weight")) layer.ffn_down = tensor;
             }
-        } else if (strstr(name, "output.weight")) {
-            model_.output = tensor;
         }
     }
+    
+    // Weight tying: LM head shares token embedding weights
+    model_.output = model_.token_embd;
     
     return true;
 }
 
 bool TextDecoder::load_tensor_data(const std::string & path, struct gguf_context * ctx) {
-    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!backend) {
-        error_msg_ = "Failed to initialize CPU backend for loading";
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        error_msg_ = "Failed to open file for mmap: " + path;
         return false;
     }
     
-    model_.buffer = ggml_backend_alloc_ctx_tensors(model_.ctx, backend);
-    if (!model_.buffer) {
-        error_msg_ = "Failed to allocate tensor buffer";
-        ggml_backend_free(backend);
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        error_msg_ = "Failed to stat file: " + path;
+        close(fd);
         return false;
     }
     
-    FILE * f = fopen(path.c_str(), "rb");
-    if (!f) {
-        error_msg_ = "Failed to open file for reading: " + path;
-        ggml_backend_free(backend);
+    void * mmap_addr = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    
+    if (mmap_addr == MAP_FAILED) {
+        error_msg_ = "Failed to mmap file: " + path;
         return false;
     }
+    
+    model_.mmap_addr = mmap_addr;
+    model_.mmap_size = st.st_size;
     
     const size_t data_offset = gguf_get_data_offset(ctx);
+    const size_t total_size = st.st_size - data_offset;
+    uint8_t * data_base = (uint8_t *)mmap_addr + data_offset;
+    
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
-    std::vector<uint8_t> read_buf;
+    size_t max_tensor_size = 0;
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        size_t sz = gguf_get_tensor_size(ctx, i);
+        if (sz > max_tensor_size) max_tensor_size = sz;
+    }
+
+    // Try GPU device buffer (zero-copy on Apple Silicon unified memory)
+    ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_dev) {
+        model_.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
+    }
+    if (!model_.buffer) {
+        model_.buffer = ggml_backend_cpu_buffer_from_ptr(data_base, total_size);
+    }
+    if (!model_.buffer) {
+        error_msg_ = "Failed to create buffer from mmap";
+        munmap(mmap_addr, st.st_size);
+        model_.mmap_addr = nullptr;
+        model_.mmap_size = 0;
+        return false;
+    }
     
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx, i);
         size_t offset = gguf_get_tensor_offset(ctx, i);
         
         auto it = model_.tensors.find(name);
-        if (it == model_.tensors.end()) {
-            continue;
-        }
+        if (it == model_.tensors.end()) continue;
         
         struct ggml_tensor * tensor = it->second;
-        size_t nbytes = ggml_nbytes(tensor);
-        
-        read_buf.resize(nbytes);
-        
-        if (fseek(f, data_offset + offset, SEEK_SET) != 0) {
-            error_msg_ = "Failed to seek to tensor data: " + std::string(name);
-            fclose(f);
-            ggml_backend_free(backend);
-            return false;
-        }
-        
-        if (fread(read_buf.data(), 1, nbytes, f) != nbytes) {
-            error_msg_ = "Failed to read tensor data: " + std::string(name);
-            fclose(f);
-            ggml_backend_free(backend);
-            return false;
-        }
-        
-        ggml_backend_tensor_set(tensor, read_buf.data(), 0, nbytes);
+        tensor->buffer = model_.buffer;
+        tensor->data = data_base + offset;
     }
-    
-    fclose(f);
-    ggml_backend_free(backend);
     
     return true;
 }
@@ -332,17 +363,18 @@ bool TextDecoder::init_kv_cache(int32_t n_ctx) {
     
     for (int il = 0; il < cfg.n_decoder_layers; ++il) {
         state_.cache.k_cache[il] = ggml_new_tensor_3d(
-            state_.cache.ctx, GGML_TYPE_F32,
+            state_.cache.ctx, GGML_TYPE_F16,
             cfg.head_dim, cfg.n_key_value_heads, n_ctx);
         ggml_format_name(state_.cache.k_cache[il], "k_cache_%d", il);
         
         state_.cache.v_cache[il] = ggml_new_tensor_3d(
-            state_.cache.ctx, GGML_TYPE_F32,
+            state_.cache.ctx, GGML_TYPE_F16,
             cfg.head_dim, cfg.n_key_value_heads, n_ctx);
         ggml_format_name(state_.cache.v_cache[il], "v_cache_%d", il);
     }
     
-    state_.cache.buffer = ggml_backend_alloc_ctx_tensors(state_.cache.ctx, state_.backend);
+    ggml_backend_t kv_backend = state_.backend_gpu ? state_.backend_gpu : state_.backend_cpu;
+    state_.cache.buffer = ggml_backend_alloc_ctx_tensors(state_.cache.ctx, kv_backend);
     if (!state_.cache.buffer) {
         error_msg_ = "Failed to allocate KV cache buffer";
         return false;
@@ -528,7 +560,11 @@ struct ggml_cgraph * TextDecoder::build_graph(
     }
     
     cur = inpL;
-    
+
+    if (n_tokens > 1) {
+        cur = ggml_view_2d(ctx0, cur, hidden_size, 1, cur->nb[1], (n_tokens - 1) * cur->nb[1]);
+    }
+
     cur = ggml_rms_norm(ctx0, cur, eps);
     cur = ggml_mul(ctx0, cur, model_.output_norm);
     ggml_set_name(cur, "result_norm");
@@ -562,7 +598,7 @@ bool TextDecoder::forward_with_audio(
     }
     
     if (state_.cache.n_ctx == 0) {
-        if (!init_kv_cache(2048)) {
+        if (!init_kv_cache(1024)) {
             return false;
         }
     }
@@ -622,7 +658,8 @@ bool TextDecoder::forward_with_audio(
     }
     
     int64_t vocab_size = logits->ne[0];
-    output.resize(n_tokens * vocab_size);
+    int64_t n_logit_rows = logits->ne[1];
+    output.resize(n_logit_rows * vocab_size);
     ggml_backend_tensor_get(logits, output.data(), 0, output.size() * sizeof(float));
     
     state_.cache.n_used = n_past + n_tokens;
@@ -641,7 +678,7 @@ bool TextDecoder::forward_debug(const int32_t * tokens, int32_t n_tokens, int32_
     }
     
     if (state_.cache.n_ctx == 0) {
-        if (!init_kv_cache(2048)) {
+        if (!init_kv_cache(1024)) {
             return false;
         }
     }
@@ -706,6 +743,11 @@ void free_decoder_model(text_decoder_model & model) {
     if (model.ctx) {
         ggml_free(model.ctx);
         model.ctx = nullptr;
+    }
+    if (model.mmap_addr) {
+        munmap(model.mmap_addr, model.mmap_size);
+        model.mmap_addr = nullptr;
+        model.mmap_size = 0;
     }
     model.tensors.clear();
     model.layers.clear();

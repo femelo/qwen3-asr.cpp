@@ -3,6 +3,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace qwen3_asr {
 
@@ -250,64 +254,69 @@ bool GGUFLoader::create_tensors(struct gguf_context * ctx, audio_encoder_model &
 
 bool GGUFLoader::load_tensor_data(const std::string & path, struct gguf_context * ctx, 
                                    audio_encoder_model & model) {
-    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!backend) {
-        error_msg_ = "Failed to initialize CPU backend";
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        error_msg_ = "Failed to open file for mmap: " + path;
         return false;
     }
     
-    model.buffer = ggml_backend_alloc_ctx_tensors(model.ctx, backend);
-    if (!model.buffer) {
-        error_msg_ = "Failed to allocate tensor buffer";
-        ggml_backend_free(backend);
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        error_msg_ = "Failed to stat file: " + path;
+        close(fd);
         return false;
     }
     
-    FILE * f = fopen(path.c_str(), "rb");
-    if (!f) {
-        error_msg_ = "Failed to open file for reading: " + path;
-        ggml_backend_free(backend);
+    void * mmap_addr = mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    
+    if (mmap_addr == MAP_FAILED) {
+        error_msg_ = "Failed to mmap file: " + path;
         return false;
     }
+    
+    model.mmap_addr = mmap_addr;
+    model.mmap_size = st.st_size;
     
     const size_t data_offset = gguf_get_data_offset(ctx);
+    const size_t total_size = st.st_size - data_offset;
+    uint8_t * data_base = (uint8_t *)mmap_addr + data_offset;
     
+    // Find largest tensor for max_tensor_size hint
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
-    std::vector<uint8_t> read_buf;
+    size_t max_tensor_size = 0;
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        size_t sz = gguf_get_tensor_size(ctx, i);
+        if (sz > max_tensor_size) max_tensor_size = sz;
+    }
+
+    // Try GPU device buffer (zero-copy on Apple Silicon unified memory)
+    ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_dev) {
+        model.buffer = ggml_backend_dev_buffer_from_host_ptr(gpu_dev, data_base, total_size, max_tensor_size);
+    }
+    if (!model.buffer) {
+        model.buffer = ggml_backend_cpu_buffer_from_ptr(data_base, total_size);
+    }
+    if (!model.buffer) {
+        error_msg_ = "Failed to create buffer from mmap";
+        munmap(mmap_addr, st.st_size);
+        model.mmap_addr = nullptr;
+        model.mmap_size = 0;
+        return false;
+    }
     
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx, i);
         size_t offset = gguf_get_tensor_offset(ctx, i);
         
         auto it = model.tensors.find(name);
-        if (it == model.tensors.end()) {
-            continue;
-        }
+        if (it == model.tensors.end()) continue;
         
         struct ggml_tensor * tensor = it->second;
-        size_t nbytes = ggml_nbytes(tensor);
-        
-        read_buf.resize(nbytes);
-        
-        if (fseek(f, data_offset + offset, SEEK_SET) != 0) {
-            error_msg_ = "Failed to seek to tensor data: " + std::string(name);
-            fclose(f);
-            ggml_backend_free(backend);
-            return false;
-        }
-        
-        if (fread(read_buf.data(), 1, nbytes, f) != nbytes) {
-            error_msg_ = "Failed to read tensor data: " + std::string(name);
-            fclose(f);
-            ggml_backend_free(backend);
-            return false;
-        }
-        
-        ggml_backend_tensor_set(tensor, read_buf.data(), 0, nbytes);
+        tensor->buffer = model.buffer;
+        tensor->data = data_base + offset;
     }
-    
-    fclose(f);
-    ggml_backend_free(backend);
     
     return true;
 }
@@ -320,6 +329,11 @@ void free_model(audio_encoder_model & model) {
     if (model.ctx) {
         ggml_free(model.ctx);
         model.ctx = nullptr;
+    }
+    if (model.mmap_addr) {
+        munmap(model.mmap_addr, model.mmap_size);
+        model.mmap_addr = nullptr;
+        model.mmap_size = 0;
     }
     model.tensors.clear();
     model.layers.clear();

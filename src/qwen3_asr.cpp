@@ -31,12 +31,6 @@ bool Qwen3ASR::load_model(const std::string & model_path) {
         return false;
     }
     
-    const int32_t max_ctx = 2048;
-    if (!decoder_.init_kv_cache(max_ctx)) {
-        error_msg_ = "Failed to initialize KV cache: " + decoder_.get_error();
-        return false;
-    }
-    
     generate_mel_filters(mel_filters_, QWEN_N_MELS, QWEN_N_FFT, QWEN_SAMPLE_RATE);
     
     model_loaded_ = true;
@@ -217,7 +211,11 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
                               std::vector<int32_t> & output_tokens) {
     const auto & cfg = decoder_.get_config();
     
-    decoder_.clear_kv_cache();
+    int32_t n_ctx_needed = input_tokens.size() + params.max_tokens;
+    if (!decoder_.init_kv_cache(n_ctx_needed)) {
+        error_msg_ = "Failed to initialize KV cache: " + decoder_.get_error();
+        return false;
+    }
     
     std::vector<float> logits;
     
@@ -239,8 +237,7 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
     int32_t vocab_size = cfg.vocab_size;
     int32_t n_input = input_tokens.size();
     
-    const float * last_logits = logits.data() + (n_input - 1) * vocab_size;
-    int32_t next_token = sample_greedy(last_logits, vocab_size);
+    int32_t next_token = sample_greedy(logits.data(), vocab_size);
     
     output_tokens.clear();
     output_tokens.push_back(next_token);

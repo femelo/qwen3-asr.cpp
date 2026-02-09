@@ -32,9 +32,16 @@ add_library(mel_spectrogram STATIC
 target_include_directories(mel_spectrogram PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-target_link_libraries(mel_spectrogram PRIVATE
-    Threads::Threads
-)
+if(APPLE)
+    target_link_libraries(mel_spectrogram PRIVATE
+        Threads::Threads
+        "-framework Accelerate"
+    )
+else()
+    target_link_libraries(mel_spectrogram PRIVATE
+        Threads::Threads
+    )
+endif()
 
 # Audio encoder library (GGML-based)
 add_library(audio_encoder STATIC

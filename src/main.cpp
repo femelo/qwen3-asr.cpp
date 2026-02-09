@@ -1,6 +1,7 @@
 #include "qwen3_asr.h"
 #include "forced_aligner.h"
 #include "timing.h"
+#include "ggml.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -279,7 +280,16 @@ static int run_transcription(const cli_params & params) {
     return 0;
 }
 
+static void ggml_log_callback_quiet(enum ggml_log_level level, const char * text, void * user_data) {
+    (void)user_data;
+    if (level >= GGML_LOG_LEVEL_WARN) {
+        fputs(text, stderr);
+    }
+}
+
 int main(int argc, char ** argv) {
+    ggml_log_set(ggml_log_callback_quiet, nullptr);
+
     cli_params params;
     
     if (!parse_args(argc, argv, params)) {

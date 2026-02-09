@@ -9,6 +9,11 @@
 #include <thread>
 #include <vector>
 
+#ifdef __APPLE__
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -24,10 +29,14 @@ struct GlobalCache {
     float sin_vals[SIN_COS_N_COUNT];
     float cos_vals[SIN_COS_N_COUNT];
     double hann_window[QWEN_N_FFT];
+    float hann_window_f[QWEN_N_FFT];
 
     GlobalCache() {
         fill_sin_cos_table();
         fill_hann_window(QWEN_N_FFT, true, hann_window);
+        for (int i = 0; i < QWEN_N_FFT; i++) {
+            hann_window_f[i] = static_cast<float>(hann_window[i]);
+        }
     }
 
     void fill_sin_cos_table() {
@@ -478,21 +487,17 @@ bool log_mel_spectrogram(const float* samples, int n_samples,
     const int frame_size = QWEN_N_FFT;
     const int frame_step = QWEN_HOP_LENGTH;
 
-    const double* hann = global_cache.hann_window;
-
     // Center padding: n_fft//2 on each side (matches HuggingFace/librosa center=True)
-    int pad_amount = frame_size / 2;  // 200 samples
+    int pad_amount = frame_size / 2;
 
     // Create padded samples with reflective padding on both sides
     std::vector<float> samples_padded;
     samples_padded.resize(n_samples + 2 * pad_amount);
-    
-    // Copy original samples with offset
+
     std::copy(samples, samples + n_samples, samples_padded.begin() + pad_amount);
 
-    // Reflective pad at beginning: mirror samples[1..pad_amount] to the left
     for (int i = 0; i < pad_amount; i++) {
-        int src_idx = pad_amount - i;  // samples[pad_amount-i] -> padded[i]
+        int src_idx = pad_amount - i;
         if (src_idx < n_samples) {
             samples_padded[i] = samples[src_idx];
         } else {
@@ -500,9 +505,8 @@ bool log_mel_spectrogram(const float* samples, int n_samples,
         }
     }
 
-    // Reflective pad at end: mirror samples[n_samples-2..n_samples-pad_amount-1] to the right
     for (int i = 0; i < pad_amount; i++) {
-        int src_idx = n_samples - 2 - i;  // samples[n_samples-2-i] -> padded[n_samples+pad_amount+i]
+        int src_idx = n_samples - 2 - i;
         if (src_idx >= 0) {
             samples_padded[n_samples + pad_amount + i] = samples[src_idx];
         } else {
@@ -510,20 +514,62 @@ bool log_mel_spectrogram(const float* samples, int n_samples,
         }
     }
 
-    // Calculate mel dimensions
-    // Number of frames = (padded_length - frame_size) / frame_step + 1
-    // But HuggingFace removes the last frame, so we compute n_len + 1 frames and discard the last
     int total_frames = (static_cast<int>(samples_padded.size()) - frame_size) / frame_step + 1;
-    
+
     mel.n_mel = filters.n_mel;
-    mel.n_len = total_frames - 1;  // Remove last frame to match HuggingFace
+    mel.n_len = total_frames - 1;
     mel.n_len_org = mel.n_len;
     mel.data.resize(mel.n_mel * mel.n_len);
 
     int compute_frames = total_frames;
+    int n_fft = filters.n_fft;
+
+#ifdef __APPLE__
+    const float* hann_f = global_cache.hann_window_f;
+
+    std::vector<float> W_cos(n_fft * frame_size);
+    std::vector<float> W_sin(n_fft * frame_size);
+    for (int k = 0; k < n_fft; k++) {
+        for (int n = 0; n < frame_size; n++) {
+            float angle = static_cast<float>(2.0 * M_PI * k * n / frame_size);
+            W_cos[k * frame_size + n] = cosf(angle);
+            W_sin[k * frame_size + n] = sinf(angle);
+        }
+    }
+
+    std::vector<float> windowed(frame_size);
+    std::vector<float> dft_re(n_fft);
+    std::vector<float> dft_im(n_fft);
+    std::vector<float> power(n_fft);
+
     std::vector<double> temp_data(mel.n_mel * compute_frames);
 
-    int n_fft = filters.n_fft;
+    for (int i = 0; i < compute_frames; i++) {
+        const int offset = i * frame_step;
+
+        vDSP_vmul(hann_f, 1, &samples_padded[offset], 1, windowed.data(), 1, frame_size);
+
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, n_fft, frame_size,
+                    1.0f, W_cos.data(), frame_size, windowed.data(), 1,
+                    0.0f, dft_re.data(), 1);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, n_fft, frame_size,
+                    -1.0f, W_sin.data(), frame_size, windowed.data(), 1,
+                    0.0f, dft_im.data(), 1);
+
+        DSPSplitComplex split = { dft_re.data(), dft_im.data() };
+        vDSP_zvmags(&split, 1, power.data(), 1, n_fft);
+
+        for (int j = 0; j < mel.n_mel; j++) {
+            float dot;
+            vDSP_dotpr(power.data(), 1, &filters.data[j * n_fft], 1, &dot, n_fft);
+            temp_data[j * compute_frames + i] = log10(std::max(static_cast<double>(dot), 1e-10));
+        }
+    }
+
+#else
+    const double* hann = global_cache.hann_window;
+
+    std::vector<double> temp_data(mel.n_mel * compute_frames);
 
     for (int i = 0; i < compute_frames; i++) {
         const int offset = i * frame_step;
@@ -552,6 +598,7 @@ bool log_mel_spectrogram(const float* samples, int n_samples,
             temp_data[j * compute_frames + i] = log10(std::max(sum, 1e-10));
         }
     }
+#endif
 
     // Clamping and normalization in double precision
     double mmax = -1e20;
