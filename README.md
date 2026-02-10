@@ -1,17 +1,20 @@
-# Qwen3-ASR GGML
+# Qwen3-ASR.cpp
 
-> **Note**: This project is an experiment in AI-assisted software development. The entire codebase (~12,500 lines of C++) was written by Claude (Anthropic's AI) through agentic loops with minimal human guidance. The goal was to explore how effectively AI agents can understand complex model architectures (HuggingFace transformers) and convert them to optimized C++ implementations (GGML) with proper testing and documentation.
-
-A high-performance C++ implementation of Qwen3-ASR and Qwen3-ForcedAligner using the GGML tensor library. Supports automatic speech recognition (ASR) and forced alignment with word-level timestamps.
+A high-performance C++ implementation of Qwen3-ASR and Qwen3-ForcedAligner using the GGML tensor library. Optimized for Apple Silicon with Metal GPU acceleration, providing fast speech recognition and word-level timestamp alignment.
 
 ## Features
 
-- **Automatic Speech Recognition (ASR)**: Transcribe audio files to text
+- **Automatic Speech Recognition (ASR)**: Transcribe audio files to text in 30+ languages
 - **Forced Alignment**: Align reference text to audio with word-level timestamps
+- **Combined Pipeline** (`--transcribe-align`): Automatically runs ASR then alignment with auto language detection
+- **Flash Attention**: Uses `ggml_flash_attn_ext()` for fast decoding (3.7x speedup)
+- **Metal GPU Acceleration**: Optimized for Apple Silicon with dual CPU+Metal backend
+- **Accelerate/vDSP**: Highly optimized mel spectrogram computation (45x speedup)
+- **mmap Weight Loading**: Zero-copy GPU transfer for fast model initialization
+- **F16 KV Cache**: Reduced memory bandwidth with half-precision key-value cache
+- **Korean Word Splitting**: Soynlp LTokenizer algorithm with 18K-word dictionary
 - **Quantization Support**: Q8_0 quantization for reduced memory usage (~40% smaller)
-- **Multi-threaded**: Configurable thread count for parallel processing
-- **Multilingual**: Supports 30+ languages including Chinese, English, Japanese, Korean, German, French, Spanish, and more
-- **Pure C++**: No Python runtime required for inference
+- **Pure C++17**: No Python runtime required for inference
 
 ## Supported Models
 
@@ -24,32 +27,30 @@ A high-performance C++ implementation of Qwen3-ASR and Qwen3-ForcedAligner using
 ## Requirements
 
 - CMake 3.14+
-- C++17 compatible compiler (GCC 8+, Clang 7+)
-- GGML library (included as dependency)
+- C++17 compatible compiler (Clang 7+, GCC 8+, MSVC 2019+)
+- Apple Silicon recommended (Metal GPU support)
+- GGML library (included as submodule)
 
 ## Building
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-repo/qwen-3-asr-ggml.git
-cd qwen-3-asr-ggml
+# Clone the repository with submodules
+git clone --recursive https://github.com/predict-woo/qwen3-asr.cpp.git
+cd qwen3-asr.cpp
 
-# Build GGML first (if not already built)
-cd /root/ggml
+# Build
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-
-# Build qwen3-asr-ggml
-cd /root/qwen-3-asr-ggml
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+cmake --build . -j$(sysctl -n hw.ncpu)
 ```
+
+On Linux, replace `$(sysctl -n hw.ncpu)` with `$(nproc)`.
 
 ## Quick Start
 
-### Transcription
+### 1. Transcription (ASR)
+
+Transcribe audio files to text:
 
 ```bash
 # Basic transcription
@@ -65,41 +66,89 @@ make -j$(nproc)
 ./build/qwen3-asr-cli -m models/qwen3-asr-0.6b-f16.gguf -f audio.wav -t 8
 ```
 
-### Forced Alignment
+### 2. Forced Alignment
+
+Align reference text to audio with word-level timestamps:
 
 ```bash
-# Align text to audio (outputs JSON with word timestamps)
+# Basic alignment
 ./build/qwen3-asr-cli \
-    -m models/qwen3-forced-aligner-0.6b-f16.gguf \
-    -f audio.wav \
-    --align \
-    --text "Hello world, this is a test."
+  -m models/qwen3-forced-aligner-0.6b-f16.gguf \
+  -f audio.wav \
+  --align \
+  --text "transcript text" \
+  --lang korean
 
-# Save alignment to file
+# Save alignment to JSON file
 ./build/qwen3-asr-cli \
-    -m models/qwen3-forced-aligner-0.6b-f16.gguf \
-    -f audio.wav \
-    --align \
-    --text "Hello world" \
-    -o alignment.json
+  -m models/qwen3-forced-aligner-0.6b-f16.gguf \
+  -f audio.wav \
+  --align \
+  --text "Hello world" \
+  -o alignment.json
 ```
+
+### 3. Combined Pipeline (Transcribe + Align)
+
+Automatically transcribe and then align the result (recommended):
+
+```bash
+./build/qwen3-asr-cli \
+  -m models/qwen3-asr-0.6b-f16.gguf \
+  --aligner-model models/qwen3-forced-aligner-0.6b-f16.gguf \
+  -f audio.wav \
+  --transcribe-align
+```
+
+This mode automatically:
+- Runs ASR to get the transcript
+- Detects the language from the ASR output
+- Runs forced alignment with the detected language
+- Outputs word-level timestamps as JSON
 
 ### Output Formats
 
 **Transcription** outputs plain text:
 ```
-Hello world, this is a test transcription.
+language Korean 안녕하세요 여러분 오늘은...
 ```
 
 **Forced Alignment** outputs JSON with word-level timestamps:
 ```json
 {
   "words": [
-    {"word": "Hello", "start": 0.000, "end": 0.320},
-    {"word": "world", "start": 0.320, "end": 0.640}
+    {"word": "안녕하세요", "start": 0.000, "end": 0.480},
+    {"word": "여러분", "start": 0.480, "end": 0.880},
+    {"word": "오늘은", "start": 0.880, "end": 1.200}
   ]
 }
 ```
+
+## Performance
+
+Benchmark on 92-second Korean audio, Apple M2 Pro (10-core CPU, 16-core GPU):
+
+| Stage | Time |
+|-------|------|
+| Mel spectrogram | 98 ms |
+| Audio encoding | 715 ms |
+| Text decoding (323 tokens) | 4,194 ms |
+| **ASR Total** | **5,007 ms** |
+| Forced alignment (183 words) | 12,998 ms |
+| **Combined Total** | **18,005 ms** |
+
+**Memory Usage:** ~247 MB RSS, ~294 MB Metal
+
+### Key Optimizations
+
+- **Flash Attention** (`ggml_flash_attn_ext`): 3.7x decode speedup vs. standard attention
+- **Metal GPU Dual Backend**: Automatic scheduling between CPU and GPU for optimal performance
+- **mmap + Zero-Copy GPU Transfer**: Fast model loading via `ggml_backend_dev_buffer_from_host_ptr`
+- **F16 KV Cache**: Half-precision key-value cache reduces memory bandwidth
+- **Selective Logits**: Only compute last token logits for lm_head (saves computation)
+- **Weight Tying**: token_embd = output weight (saves memory)
+- **vDSP/Accelerate Mel**: 45x speedup for mel spectrogram computation on Apple platforms
+- **Korean Word Splitting**: Soynlp LTokenizer port with bundled 18K-word dictionary
 
 ## Model Conversion
 
@@ -152,71 +201,35 @@ The model supports 30+ languages:
 
 ## Audio Requirements
 
-- Format: WAV (PCM)
-- Sample rate: 16 kHz
-- Channels: Mono
-- Bit depth: 16-bit
+- **Format**: WAV (PCM)
+- **Sample rate**: 16 kHz
+- **Channels**: Mono
+- **Bit depth**: 16-bit
 
 Convert audio with ffmpeg:
 ```bash
 ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 ```
 
-## Running Tests
-
-```bash
-cd /root/qwen-3-asr-ggml
-
-# Run all tests
-./tests/run_all_tests.sh
-
-# Run individual tests
-./build/test_mel
-./build/test_encoder --model models/qwen3-asr-0.6b-f16.gguf
-./build/test_decoder --model models/qwen3-asr-0.6b-f16.gguf
-```
-
 ## Performance Profiling
 
-Build with timing instrumentation enabled to profile performance:
+Build with timing instrumentation to see detailed breakdowns:
 
 ```bash
 mkdir -p build && cd build
-cmake -DQWEN3_ASR_TIMING=ON ..
-make -j$(nproc)
+cmake .. -DCMAKE_BUILD_TYPE=Release -DQWEN3_ASR_TIMING=ON
+cmake --build . -j$(sysctl -n hw.ncpu)
 
-# Run with --profile flag to see detailed timing breakdown
+# Run with --profile flag
 ./qwen3-asr-cli -m models/qwen3-asr-0.6b-f16.gguf -f sample.wav --profile
 ```
 
-### Timing Breakdown (30s audio, F16 model, 4 threads)
-
-| Section | Time (ms) | Calls | Avg (ms) |
-|---------|-----------|-------|----------|
-| mel_spectrogram | 6,703 | 1 | 6,703 |
-| audio_encoding.conv_chunk | 1,726 | 30 | 58 |
-| audio_encoding.transformer | 2,353 | 1 | 2,353 |
-| decode.initial_forward | 5,847 | 1 | 5,847 |
-| decode.token | 1,170 | 19 | 62 |
-| **Total** | **~18,000** | - | - |
-
-### Performance Notes
-
-- **Mel spectrogram** (~38%): FFT computation is CPU-intensive. Multi-threading helps.
-- **Audio encoding** (~23%): Conv layers process 30 chunks of 100 mel frames each.
-- **Initial decode** (~33%): First forward pass processes all input tokens with audio injection.
-- **Token generation** (~6%): Each subsequent token takes ~62ms (KV cache enabled).
-
-For production builds without timing overhead:
-```bash
-cmake ..  # Without -DQWEN3_ASR_TIMING=ON
-make -j$(nproc)
-```
+For production builds, omit `-DQWEN3_ASR_TIMING=ON` to remove timing overhead.
 
 ## Project Structure
 
 ```
-qwen-3-asr-ggml/
+qwen3-asr.cpp/
 ├── src/
 │   ├── main.cpp              # CLI entry point
 │   ├── qwen3_asr.cpp/h       # High-level ASR API
@@ -225,7 +238,8 @@ qwen-3-asr-ggml/
 │   ├── text_decoder.cpp/h    # Text decoder (Qwen2 architecture)
 │   ├── mel_spectrogram.cpp/h # Mel spectrogram computation
 │   ├── audio_injection.cpp/h # Audio-text embedding injection
-│   └── gguf_loader.cpp/h     # GGUF model loading
+│   ├── gguf_loader.cpp/h     # GGUF model loading
+│   └── timing.h              # Timing instrumentation macros
 ├── tests/
 │   ├── test_mel.cpp          # Mel spectrogram tests
 │   ├── test_encoder.cpp      # Audio encoder tests
@@ -233,9 +247,10 @@ qwen-3-asr-ggml/
 │   └── reference/            # Reference data for validation
 ├── scripts/
 │   └── convert_hf_to_gguf.py # Model conversion script
-├── models/                   # GGUF model files
-├── docs/
-│   └── usage.md              # Detailed CLI documentation
+├── assets/
+│   └── korean_dict_jieba.dict # Korean word dictionary (17,968 words)
+├── models/                   # GGUF model files (not tracked in git)
+├── ggml/                     # GGML library (git submodule)
 └── CMakeLists.txt
 ```
 
@@ -247,3 +262,8 @@ This project is licensed under the MIT License. See LICENSE for details.
 
 - [GGML](https://github.com/ggerganov/ggml) - Tensor library for machine learning
 - [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) - Original model by Alibaba
+- [Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) - Original aligner model by Alibaba
+
+---
+
+*Note: This project is an experiment in AI-assisted software development. The entire codebase (~12,500 lines of C++) was written by Claude (Anthropic's AI) through agentic loops with minimal human guidance.*
