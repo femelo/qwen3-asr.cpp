@@ -265,5 +265,3 @@ This project is licensed under the MIT License. See LICENSE for details.
 - [Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) - Original aligner model by Alibaba
 
 ---
-
-*Note: This project is an experiment in AI-assisted software development. The entire codebase (~12,500 lines of C++) was written by Claude (Anthropic's AI) through agentic loops with minimal human guidance.*
