@@ -23,7 +23,7 @@ find_package(Threads REQUIRED)
 
 # GGML library paths
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
-set(GGML_BUILD_DIR "${GGML_DIR}/build")
+add_subdirectory(${GGML_DIR})
 
 # Mel spectrogram library
 add_library(mel_spectrogram STATIC
@@ -57,8 +57,6 @@ target_link_directories(audio_encoder PUBLIC
 )
 target_link_libraries(audio_encoder PUBLIC
     ggml
-    ggml-base
-    ggml-cpu
     Threads::Threads
 )
 
@@ -75,8 +73,6 @@ target_link_directories(text_decoder PUBLIC
 )
 target_link_libraries(text_decoder PUBLIC
     ggml
-    ggml-base
-    ggml-cpu
     Threads::Threads
 )
 
@@ -118,8 +114,6 @@ target_link_directories(forced_aligner PUBLIC
 target_link_libraries(forced_aligner PUBLIC
     mel_spectrogram
     ggml
-    ggml-base
-    ggml-cpu
     Threads::Threads
 )
 
@@ -188,8 +182,6 @@ target_link_directories(test_embedding PRIVATE
 )
 target_link_libraries(test_embedding PRIVATE
     ggml
-    ggml-base
-    ggml-cpu
     Threads::Threads
 )
 
