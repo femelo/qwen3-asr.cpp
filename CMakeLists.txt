@@ -126,6 +126,19 @@ target_link_libraries(qwen3-asr-cli PRIVATE
     forced_aligner
 )
 
+find_package(OpenMP REQUIRED)
+add_executable(general-quantize
+    src/quantize.cpp
+)
+target_link_libraries(general-quantize PRIVATE
+    ggml
+    OpenMP::OpenMP_CXX
+)
+if(OpenMP_CXX_SPECIFIC_FLAGS)
+    target_compile_options(general-quantize PRIVATE ${OpenMP_CXX_SPECIFIC_FLAGS})
+endif()
+
+
 # Test executable for mel spectrogram
 add_executable(test_mel
     tests/test_mel.cpp
