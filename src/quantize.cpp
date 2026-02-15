@@ -50,19 +50,6 @@ bool should_quantize(const std::string & name, struct ggml_tensor * tensor, ggml
 }
 
 
-int convert_to_f32(struct ggml_tensor * tensor, int64_t n_elements, const float * data_ptr) {
-    std::vector<float> f32_buf(n_elements);
-    // data_ptr = nullptr;
-    if (tensor->type == GGML_TYPE_F16) {
-        ggml_fp16_to_fp32_row((const ggml_fp16_t *)tensor->data, f32_buf.data(), n_elements);
-        data_ptr = f32_buf.data();
-    } else {
-        data_ptr = (const float *)tensor->data;
-    }
-    return 0;
-}
-
-
 int main(int argc, char ** argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s input.gguf output.gguf type\n", argv[0]);

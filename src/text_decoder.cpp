@@ -860,6 +860,10 @@ std::string TextDecoder::decode_token(int32_t token_id) const {
         return "";
     }
     if (token.size() >= 5 && token.substr(0, 4) == "[PAD") {
+        // Return a delimiter for special tokens that mark the start of text
+        if (token == "[PAD151704]") {
+            return "|";
+        }
         return "";
     }
 

@@ -130,11 +130,27 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
     }
     result.t_decode_ms = get_time_ms() - t_decode_start;
     
-    result.tokens = output_tokens;
-    result.text = decoder_.decode_tokens(output_tokens);
-    result.success = true;
+    std::string transcript = "";
+    std::string language = "unknown";
+    std::string full_text = decoder_.decode_tokens(output_tokens);
     
     result.t_total_ms = get_time_ms() - t_total_start;
+    
+    // Quick string-based split if you don't want to loop tokens
+    size_t pos = full_text.find("language ");
+    if (pos != std::string::npos) {
+        // Find where the next word ends (the language name)
+        size_t end_pos = full_text.find_first_of("|", pos + 9);
+        language = full_text.substr(pos + 9, end_pos - (pos + 9));
+        transcript = full_text.substr(end_pos + 1);
+    } else {
+        transcript = full_text;
+    }
+    
+    result.language = language;
+    result.tokens = output_tokens;
+    result.text = transcript;
+    result.success = true;
     
     if (params.print_timing) {
         fprintf(stderr, "\nTiming:\n");
@@ -142,6 +158,7 @@ transcribe_result Qwen3ASR::transcribe_internal(const float * samples, int n_sam
         fprintf(stderr, "  Audio encoding:  %lld ms\n", (long long)result.t_encode_ms);
         fprintf(stderr, "  Text decoding:   %lld ms\n", (long long)result.t_decode_ms);
         fprintf(stderr, "  Total:           %lld ms\n", (long long)result.t_total_ms);
+        fprintf(stderr, "  Language:        %s\n", result.language.c_str());
         fprintf(stderr, "  Tokens generated: %zu\n", output_tokens.size());
     }
     

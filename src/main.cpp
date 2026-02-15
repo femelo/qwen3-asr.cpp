@@ -160,73 +160,6 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
     return true;
 }
 
-static std::string detect_language(const std::string & asr_text) {
-    const std::string prefix = "language ";
-    if (asr_text.size() < prefix.size() || asr_text.compare(0, prefix.size(), prefix) != 0) {
-        return "";
-    }
-
-    size_t pos = prefix.size();
-    if (pos >= asr_text.size()) {
-        return "";
-    }
-
-    unsigned char first = static_cast<unsigned char>(asr_text[pos]);
-    if (!std::isupper(first)) {
-        return "";
-    }
-
-    ++pos;
-    while (pos < asr_text.size()) {
-        unsigned char c = static_cast<unsigned char>(asr_text[pos]);
-        if (!std::islower(c)) {
-            break;
-        }
-        ++pos;
-    }
-
-    std::string lang = asr_text.substr(prefix.size(), pos - prefix.size());
-    std::transform(lang.begin(), lang.end(), lang.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return lang;
-}
-
-static std::string extract_transcript(const std::string & asr_text) {
-    const std::string prefix = "language ";
-    if (asr_text.size() < prefix.size() || asr_text.compare(0, prefix.size(), prefix) != 0) {
-        return asr_text;
-    }
-
-    size_t pos = prefix.size();
-    if (pos >= asr_text.size()) {
-        return "";
-    }
-
-    unsigned char first = static_cast<unsigned char>(asr_text[pos]);
-    if (!std::isupper(first)) {
-        return asr_text;
-    }
-
-    ++pos;
-    while (pos < asr_text.size()) {
-        unsigned char c = static_cast<unsigned char>(asr_text[pos]);
-        if (!std::islower(c)) {
-            break;
-        }
-        ++pos;
-    }
-
-    while (pos < asr_text.size()) {
-        unsigned char c = static_cast<unsigned char>(asr_text[pos]);
-        if (c >= 0x80 || !std::isspace(c)) {
-            break;
-        }
-        ++pos;
-    }
-
-    return asr_text.substr(pos);
-}
-
 static std::string escape_json_string(const std::string & s) {
     std::string result;
     result.reserve(s.size() + 10);
@@ -441,9 +374,9 @@ static int run_transcribe_and_align(const cli_params & params) {
         return 1;
     }
 
-    std::string detected_lang = detect_language(asr_result.text);
+    std::string detected_lang = asr_result.language;
     std::string align_lang = params.language.empty() ? detected_lang : params.language;
-    std::string transcript = extract_transcript(asr_result.text);
+    std::string transcript = asr_result.text;
 
     fprintf(stderr, "  Detected language: %s\n", detected_lang.empty() ? "(none)" : detected_lang.c_str());
     if (!params.language.empty()) {
