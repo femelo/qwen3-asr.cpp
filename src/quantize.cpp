@@ -37,7 +37,8 @@ bool should_quantize(const std::string & name, struct ggml_tensor * tensor, ggml
     // 1. Skip by name (standard heuristic)
     if (name.find("bias") != std::string::npos || 
         name.find("norm") != std::string::npos ||
-        name.find("token_embd") != std::string::npos) {
+        name.find("token_embd") != std::string::npos ||
+        name.find("ln_post") !=  std::string::npos) {
         return false;
     }
 
