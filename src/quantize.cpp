@@ -3,7 +3,9 @@
 #include <cstdio>
 #include <vector>
 #include <string>
+#include <cstring>
 #include <algorithm>
+#include <omp.h>
 
 
 ggml_type ggml_parse_type(const std::string & str) {
@@ -32,7 +34,7 @@ bool is_aligned(struct ggml_tensor * tensor, ggml_type type) {
 
 
 bool should_quantize(const std::string & name, struct ggml_tensor * tensor, ggml_type type) {
-    // 1. Skip by name (Standard heuristic)
+    // 1. Skip by name (standard heuristic)
     if (name.find("bias") != std::string::npos || 
         name.find("norm") != std::string::npos ||
         name.find("token_embd") != std::string::npos) {
@@ -41,12 +43,23 @@ bool should_quantize(const std::string & name, struct ggml_tensor * tensor, ggml
 
     // 2. Skip if not aligned (CRITICAL for Conv layers)
     if (!is_aligned(tensor, type)) {
-        printf("  Skipping %-30s: Shape [%lld, %lld] not aligned with block size %d\n", 
-               name.c_str(), tensor->ne[0], tensor->ne[1], ggml_blck_size(type));
         return false;
     }
 
     return true;
+}
+
+
+int convert_to_f32(struct ggml_tensor * tensor, int64_t n_elements, const float * data_ptr) {
+    std::vector<float> f32_buf(n_elements);
+    // data_ptr = nullptr;
+    if (tensor->type == GGML_TYPE_F16) {
+        ggml_fp16_to_fp32_row((const ggml_fp16_t *)tensor->data, f32_buf.data(), n_elements);
+        data_ptr = f32_buf.data();
+    } else {
+        data_ptr = (const float *)tensor->data;
+    }
+    return 0;
 }
 
 
@@ -58,12 +71,7 @@ int main(int argc, char ** argv) {
 
     const char * fname_inp = argv[1];
     const char * fname_out = argv[2];
-    ggml_type type = ggml_parse_type(argv[3]);
-
-    if (type == GGML_TYPE_COUNT) {
-        fprintf(stderr, "Invalid quantization type: %s\n", argv[3]);
-        return 1;
-    }
+    ggml_type target_type  = ggml_parse_type(argv[3]);
 
     struct ggml_context * ctx_data = NULL;
     struct gguf_init_params params = { .no_alloc = false, .ctx = &ctx_data };
@@ -71,69 +79,109 @@ int main(int argc, char ** argv) {
     if (!ctx_inp) return 1;
 
     struct gguf_context * ctx_out = gguf_init_empty();
-
-    // 1. Correct Metadata Copy
-    int n_kv = gguf_get_n_kv(ctx_inp);
-    for (int i = 0; i < n_kv; ++i) {
-        const char * key = gguf_get_key(ctx_inp, i);
-        gguf_set_kv(ctx_out, ctx_inp); // Added the key argument
-    }
+    gguf_set_kv(ctx_out, ctx_inp);
 
     int n_tensors = gguf_get_n_tensors(ctx_inp);
     struct ggml_init_params meta_params = {
-        .mem_size   = ggml_tensor_overhead() * n_tensors + (1024 * 1024), // Extra room for metadata
-        .mem_buffer = NULL,
+        .mem_size   = ggml_tensor_overhead() * n_tensors + (2 * 1024 * 1024),
         .no_alloc   = true,
     };
     struct ggml_context * ctx_meta = ggml_init(meta_params);
     
-    std::vector<void *> allocated_data; // Tracker for cleanup
+    // Preparation for parallel results
+    std::vector<struct ggml_tensor *> new_tensors(n_tensors);
+    std::vector<void *> allocated_data(n_tensors, nullptr);
 
+    printf("Starting quantization with %d threads...\n", omp_get_max_threads());
+
+    #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx_inp, i);
         struct ggml_tensor * tensor = ggml_get_tensor(ctx_data, name);
+        int64_t n_elements = ggml_nelements(tensor);
 
-        if (should_quantize(name, tensor, type) && (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16)) {
-            printf("Quantizing %-40s to %s\n", name, argv[3]);
-
-            int64_t n_elements = ggml_nelements(tensor);
-            
-            // --- F16 -> F32 Bridge ---
-            std::vector<float> f32_buffer;
-            const float * src_data = nullptr;
+        if (should_quantize(name, tensor, target_type) && (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16)) {
+            // Bridge to F32
+            std::vector<float> f32_buf(n_elements);
+            const float * src_ptr = nullptr;
             if (tensor->type == GGML_TYPE_F16) {
-                f32_buffer.resize(n_elements);
-                ggml_fp16_to_fp32_row((const ggml_fp16_t *)tensor->data, f32_buffer.data(), n_elements);
-                src_data = f32_buffer.data();
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *)tensor->data, f32_buf.data(), n_elements);
+                src_ptr = f32_buf.data();
             } else {
-                src_data = (const float *)tensor->data;
+                src_ptr = (const float *)tensor->data;
             }
 
-            // Quantize
-            size_t size_new = ggml_row_size(type, n_elements);
+            size_t size_new = ggml_row_size(target_type, n_elements);
             void * data_new = malloc(size_new);
-            allocated_data.push_back(data_new);
+            allocated_data[i] = data_new;
 
-            int64_t n_per_row = tensor->ne[0];
-            int64_t n_rows = n_elements / n_per_row;
-            
-            ggml_quantize_chunk(type, src_data, data_new, 0, n_rows, n_per_row, nullptr);
+            ggml_quantize_chunk(target_type, src_ptr, data_new, 0, n_elements / tensor->ne[0], tensor->ne[0], nullptr);
 
-            struct ggml_tensor * q_tensor = ggml_new_tensor(ctx_meta, type, ggml_n_dims(tensor), tensor->ne);
-            ggml_set_name(q_tensor, name);
-            q_tensor->data = data_new;
+            #pragma omp critical
+            {
+                printf("[%3d/%d] Quantizing %-40s to %s\n", i+1, n_tensors, name, ggml_type_name(target_type));
+                struct ggml_tensor * q_t = ggml_new_tensor(ctx_meta, target_type, ggml_n_dims(tensor), tensor->ne);
+                ggml_set_name(q_t, name);
+                q_t->data = data_new;
+                new_tensors[i] = q_t;
+            }
+        }
+        else if (tensor->type == GGML_TYPE_F16) {
+            // --- SMART FALLBACK SYSTEM ---
+            ggml_type fallback_type = GGML_TYPE_F32; // Default fallback
 
-            // CRITICAL: Actually add the quantized tensor to the file!
-            gguf_add_tensor(ctx_out, q_tensor); 
-        } else {
-            printf("Copying   %-40s (No Quant)\n", name);
-            gguf_add_tensor(ctx_out, tensor);
+            // Try to use Q8_0 if it's aligned (better than F16 or F32)
+            if (is_aligned(tensor, GGML_TYPE_Q8_0)) {
+                fallback_type = GGML_TYPE_Q8_0;
+            }
+
+            // Prepare F32 source for the quantizer
+            std::vector<float> f32_buf(n_elements);
+            const float * src_ptr = nullptr;
+            if (tensor->type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *)tensor->data, f32_buf.data(), n_elements);
+                src_ptr = f32_buf.data();
+            } else {
+                src_ptr = (const float *)tensor->data;
+            }
+
+            int64_t n_elements = ggml_nelements(tensor);
+            size_t size_new = ggml_row_size(fallback_type, n_elements);
+            void * data_new = malloc(size_new);
+            allocated_data[i] = data_new;
+
+            if (fallback_type == GGML_TYPE_Q8_0) {
+                #pragma omp critical
+                printf("[%3d/%d] Fallback   %-40s to Q8_0\n", i+1, n_tensors, name);
+                ggml_quantize_chunk(fallback_type, src_ptr, data_new, 0, n_elements / tensor->ne[0], tensor->ne[0], nullptr);
+            } else {
+                #pragma omp critical
+                printf("[%3d/%d] Fallback   %-40s to F32\n", i+1, n_tensors, name);
+                memcpy(data_new, src_ptr, size_new);
+            }
+
+            #pragma omp critical
+            {
+                struct ggml_tensor * f_t = ggml_new_tensor(ctx_meta, fallback_type, ggml_n_dims(tensor), tensor->ne);
+                ggml_set_name(f_t, name);
+                f_t->data = data_new;
+                new_tensors[i] = f_t;
+            }
+        }
+        else {
+            new_tensors[i] = tensor; // Keep existing (F32 or already quantized)
         }
     }
 
-    // Write file and clean up
+    // Serial step to add to GGUF
+    for (int i = 0; i < n_tensors; ++i) {
+        gguf_add_tensor(ctx_out, new_tensors[i]);
+    }
+
     gguf_write_to_file(ctx_out, fname_out, false);
-    for (void * ptr : allocated_data) free(ptr);
+
+    // Cleanup
+    for (void * ptr : allocated_data) if(ptr) free(ptr);
     ggml_free(ctx_meta);
     ggml_free(ctx_data);
     gguf_free(ctx_inp);
