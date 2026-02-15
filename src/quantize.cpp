@@ -145,7 +145,6 @@ int main(int argc, char ** argv) {
                 src_ptr = (const float *)tensor->data;
             }
 
-            int64_t n_elements = ggml_nelements(tensor);
             size_t size_new = ggml_row_size(fallback_type, n_elements);
             void * data_new = malloc(size_new);
             allocated_data[i] = data_new;
