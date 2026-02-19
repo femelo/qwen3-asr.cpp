@@ -170,6 +170,7 @@ private:
     text_decoder_state state_;
     std::string error_msg_;
     std::vector<std::string> vocab_;
+    // float temperature_ = 1.0f;
 };
 
 // Free model resources

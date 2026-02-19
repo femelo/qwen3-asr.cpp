@@ -568,6 +568,7 @@ struct ggml_cgraph * TextDecoder::build_graph(
     ggml_set_name(cur, "result_norm");
     
     cur = ggml_mul_mat(ctx0, model_.output, cur);
+    // cur = ggml_scale_inplace(ctx0, cur, 1.0f / temperature_);
     ggml_set_name(cur, "logits");
     ggml_set_output(cur);
     
