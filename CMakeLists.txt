@@ -4,6 +4,7 @@ project(qwen3-asr-ggml VERSION 0.1.0 LANGUAGES CXX)
 # C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Compiler flags
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -24,6 +25,14 @@ find_package(Threads REQUIRED)
 # GGML library paths
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 add_subdirectory(${GGML_DIR})
+
+# Detect Metal backend availability via GGML option (set by ggml's CMakeLists)
+if(APPLE AND GGML_METAL)
+    set(GGML_HAS_METAL ON)
+    message(STATUS "GGML Metal backend enabled — GPU acceleration enabled")
+else()
+    set(GGML_HAS_METAL OFF)
+endif()
 
 # Mel spectrogram library
 add_library(mel_spectrogram STATIC
@@ -59,6 +68,9 @@ target_link_libraries(audio_encoder PUBLIC
     ggml
     Threads::Threads
 )
+if(GGML_HAS_METAL)
+    target_link_libraries(audio_encoder PUBLIC ggml-metal "-framework Metal" "-framework MetalKit")
+endif()
 
 # Text decoder library (GGML-based)
 add_library(text_decoder STATIC
@@ -75,6 +87,9 @@ target_link_libraries(text_decoder PUBLIC
     ggml
     Threads::Threads
 )
+if(GGML_HAS_METAL)
+    target_link_libraries(text_decoder PUBLIC ggml-metal "-framework Metal" "-framework MetalKit")
+endif()
 
 # Audio injection library (pure C++, no GGML dependency)
 add_library(audio_injection STATIC
@@ -116,6 +131,9 @@ target_link_libraries(forced_aligner PUBLIC
     ggml
     Threads::Threads
 )
+if(GGML_HAS_METAL)
+    target_link_libraries(forced_aligner PUBLIC ggml-metal "-framework Metal" "-framework MetalKit")
+endif()
 
 # CLI executable
 add_executable(qwen3-asr-cli
@@ -126,16 +144,21 @@ target_link_libraries(qwen3-asr-cli PRIVATE
     forced_aligner
 )
 
-find_package(OpenMP REQUIRED)
+find_package(OpenMP)
 add_executable(general-quantize
     src/quantize.cpp
 )
-target_link_libraries(general-quantize PRIVATE
-    ggml
-    OpenMP::OpenMP_CXX
-)
-if(OpenMP_CXX_SPECIFIC_FLAGS)
-    target_compile_options(general-quantize PRIVATE ${OpenMP_CXX_SPECIFIC_FLAGS})
+target_link_libraries(general-quantize PRIVATE ggml)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(general-quantize PRIVATE OpenMP::OpenMP_CXX)
+    if(OpenMP_CXX_SPECIFIC_FLAGS)
+        target_compile_options(general-quantize PRIVATE ${OpenMP_CXX_SPECIFIC_FLAGS})
+    endif()
+else()
+    message(STATUS "OpenMP not found — general-quantize will run single-threaded")
+endif()
+if(GGML_HAS_METAL)
+    target_link_libraries(general-quantize PRIVATE "-framework Metal" "-framework MetalKit" "-framework Foundation")
 endif()
 
 

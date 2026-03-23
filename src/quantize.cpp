@@ -5,7 +5,9 @@
 #include <string>
 #include <cstring>
 #include <algorithm>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 
 
 ggml_type ggml_parse_type(const std::string & str) {
@@ -80,7 +82,11 @@ int main(int argc, char ** argv) {
     std::vector<struct ggml_tensor *> new_tensors(n_tensors);
     std::vector<void *> allocated_data(n_tensors, nullptr);
 
+#ifdef _OPENMP
     printf("Starting quantization with %d threads...\n", omp_get_max_threads());
+#else
+    printf("Starting quantization (single-threaded)...\n");
+#endif
 
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < n_tensors; ++i) {
