@@ -1,6 +1,7 @@
 #include "forced_aligner.h"
 #include "mel_spectrogram.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -1561,6 +1562,29 @@ bool ForcedAligner::load_korean_dict(const std::string & dict_path) {
     return true;
 }
 
+// Strip leading and trailing ASCII punctuation from a word, returning the
+// alphabetic/numeric core.  Punctuation has no corresponding audio frames, so
+// including it in the BPE sequence fed to the forced aligner biases the
+// timestamp predictions and causes misalignment.
+static std::string strip_word_punctuation(const std::string & word) {
+    // Characters that are purely punctuation / non-speech.
+    auto is_punct = [](unsigned char c) -> bool {
+        // Keep letters, digits, and non-ASCII bytes (CJK, accented chars, …).
+        if (c > 0x7F) return false;
+        return !std::isalnum(c);
+    };
+
+    size_t start = 0;
+    while (start < word.size() && is_punct(static_cast<unsigned char>(word[start]))) {
+        ++start;
+    }
+    size_t end = word.size();
+    while (end > start && is_punct(static_cast<unsigned char>(word[end - 1]))) {
+        --end;
+    }
+    return word.substr(start, end - start);
+}
+
 std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
     const std::string & text,
     std::vector<std::string> & words,
@@ -1586,10 +1610,28 @@ std::vector<int32_t> ForcedAligner::tokenize_with_timestamps(
         }
     }
 
+    bool first_word = true;
     for (size_t w = 0; w < raw_words.size(); ++w) {
+        // Strip leading/trailing punctuation for BPE encoding; punctuation has
+        // no audio content and was not part of the model's training format.
+        std::string clean = strip_word_punctuation(raw_words[w]);
+        if (clean.empty()) {
+            // Pure-punctuation token — no audio content, skip entirely so that
+            // the words[] / timestamp-pair counts stay in sync.
+            continue;
+        }
+
+        // Preserve the original surface form (with punctuation) in the output.
         words.push_back(raw_words[w]);
 
-        std::string bpe_str = bytes_to_bpe_string(raw_words[w]);
+        // Non-first words in running text are stored in the Qwen vocabulary
+        // with a leading space (encoded as 'Ġ' by bytes_to_bpe_string).
+        // Omitting the space prefix produces the wrong token IDs and can cause
+        // silent token drops when the no-space form is absent from the vocab.
+        std::string to_encode = first_word ? clean : (" " + clean);
+        first_word = false;
+
+        std::string bpe_str = bytes_to_bpe_string(to_encode);
         std::vector<std::string> subwords = bpe_encode_word(bpe_str, model_.bpe_ranks);
 
         for (const auto & sw : subwords) {

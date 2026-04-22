@@ -236,9 +236,12 @@ bool Qwen3ASR::decode_greedy(const std::vector<int32_t> & input_tokens,
     
     std::vector<float> logits;
     
-    // Audio pad tokens start after: <|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>
-    // That's 8 tokens before the first audio_pad
-    int32_t audio_start_pos = 9;
+    int32_t audio_start_pos = find_audio_start_position(
+        input_tokens.data(), input_tokens.size(), cfg.audio_pad_token_id);
+    if (audio_start_pos < 0) {
+        error_msg_ = "Failed to find audio start position in input tokens";
+        return false;
+    }
     
     {
         QWEN3_TIMER("decode.initial_forward");
